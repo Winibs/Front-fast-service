@@ -82,7 +82,7 @@ export default function MapPage() {
 
       {isLoaded ? (
         <GoogleMap
-          mapContainerClassName="map-wrap"
+          mapContainerStyle={{ width: "100%", height: "100vh" }}
           center={ATITUS}
           zoom={14}
           onClick={onMapClick}
