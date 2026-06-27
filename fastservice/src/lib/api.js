@@ -1,22 +1,9 @@
-// ============================================================
-// Camada de API do FastService
-// ------------------------------------------------------------
-// Pronta para a SUA API (a do trabalho de Banco de Dados / Swagger).
-// Endpoints esperados (ajuste os paths conforme seu Swagger):
-//   POST /login            -> { token }              (autenticação)
-//   POST /pessoas          -> cadastro de usuário
-//   GET  /pontos           -> lista pontos do usuário (Bearer token)
-//   POST /pontos           -> cadastra um novo ponto
-//
-// Enquanto VITE_API_URL estiver vazio, tudo funciona em MODO DEMO
-// (dados mock + localStorage), então o app já roda 100% sem backend.
-// Quando você publicar sua API, basta definir VITE_API_URL no .env / Netlify.
-// ============================================================
-
 import { INITIAL_POINTS } from "../data/mock.js";
 
-const BASE = (import.meta.env.VITE_API_URL || "").replace(/\/$/, "");
-export const DEMO_MODE = !BASE;
+const DEFAULT_API_URL = "https://fastservice.up.railway.app";
+const rawApiUrl = import.meta.env.VITE_API_URL?.trim();
+const BASE = (rawApiUrl || DEFAULT_API_URL).replace(/\/+$/, "");
+export const DEMO_MODE = BASE.toLowerCase() === "demo";
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -26,6 +13,10 @@ function authHeaders() {
 }
 
 async function request(path, { method = "GET", body, auth = false } = {}) {
+  if (DEMO_MODE) {
+    throw new Error("API desativada em modo demonstração.");
+  }
+
   const res = await fetch(`${BASE}${path}`, {
     method,
     headers: {
@@ -34,31 +25,56 @@ async function request(path, { method = "GET", body, auth = false } = {}) {
     },
     body: body ? JSON.stringify(body) : undefined,
   });
+
   if (!res.ok) {
     let msg = `Erro ${res.status}`;
-    try { const j = await res.json(); msg = j.message || j.error || msg; } catch { /* */ }
+    try {
+      const text = await res.text();
+      if (text) {
+        try {
+          const data = JSON.parse(text);
+          msg = data.message || data.error || text;
+        } catch {
+          msg = text;
+        }
+      }
+    } catch {}
     throw new Error(msg);
   }
+
   const ct = res.headers.get("content-type") || "";
   return ct.includes("application/json") ? res.json() : res.text();
 }
 
-// ---------- Demo storage helpers ----------
 const demoPointsKey = (email) => `fs_points_${email || "guest"}`;
+
 function readDemoPoints(email) {
   try {
     const raw = localStorage.getItem(demoPointsKey(email));
     if (raw) return JSON.parse(raw);
-  } catch { /* */ }
+  } catch {}
   return [...INITIAL_POINTS];
 }
+
 function writeDemoPoints(email, pts) {
   localStorage.setItem(demoPointsKey(email), JSON.stringify(pts));
 }
 
-// ============================================================
-// AUTH
-// ============================================================
+function normalizeCategory(type) {
+  const value = String(type || "").toUpperCase();
+
+  if (value === "HOME" || value === "CASA") return "OUTROS";
+  if (value === "WORK" || value === "TRABALHO") return "OUTROS";
+  if (value.includes("ELETR")) return "ELETRICA";
+  if (value.includes("HIDRA")) return "HIDRAULICA";
+  if (value.includes("LIMP")) return "LIMPEZA";
+  if (value.includes("MARC")) return "MARCENARIA";
+  if (value.includes("PINT")) return "PINTURA";
+  if (value.includes("MONT")) return "MONTAGEM";
+
+  return "OUTROS";
+}
+
 export const api = {
   demo: DEMO_MODE,
 
@@ -72,39 +88,52 @@ export const api = {
       };
       return { token: "demo-token-" + Date.now(), user };
     }
-    // Ajuste o path conforme seu Swagger (ex.: /login):
-    const data = await request("/login", { method: "POST", body: { email, password } });
-    return { token: data.token, user: data.user || { email, name: email.split("@")[0] } };
+
+    const token = await request("/auth/signin", {
+      method: "POST",
+      body: { email, password },
+    });
+
+    const user = {
+      email,
+      name: email.split("@")[0].replace(/^\w/, (c) => c.toUpperCase()),
+    };
+
+    return { token, user };
   },
 
   async register({ name, email, password }) {
     if (DEMO_MODE) {
       await wait(750);
-      if (!name || !email || !password) throw new Error("Preencha todos os campos.");
+      if (!name || !email || !password) {
+        throw new Error("Preencha todos os campos.");
+      }
       return { token: "demo-token-" + Date.now(), user: { name, email } };
     }
-    // Ajuste para o seu endpoint de cadastro (ex.: /pessoas):
-    await request("/pessoas", { method: "POST", body: { nome: name, email, senha: password } });
-    // Após cadastrar, faz login para obter o token:
+
+    await request("/auth/signup", {
+      method: "POST",
+      body: { name, email, password },
+    });
+
     return this.login({ email, password });
   },
 
-  // ============================================================
-  // PONTOS (mapa)
-  // ============================================================
   async listPoints(email) {
     if (DEMO_MODE) {
       await wait(400);
       return readDemoPoints(email);
     }
-    const data = await request("/pontos", { auth: true });
-    // Normaliza para { id, name, lat, lng }
+
+    const data = await request("/ws/point", { auth: true });
+
     return (data || []).map((p) => ({
       id: p.id,
-      name: p.nome ?? p.name,
-      lat: Number(p.latitude ?? p.lat),
-      lng: Number(p.longitude ?? p.lng),
-      type: p.tipo ?? p.type ?? "home",
+      name: p.name,
+      description: p.description,
+      lat: Number(p.latitude),
+      lng: Number(p.longitude),
+      type: p.category || "OUTROS",
     }));
   },
 
@@ -117,12 +146,50 @@ export const api = {
       writeDemoPoints(email, updated);
       return next;
     }
-    const data = await request("/pontos", {
+
+    const data = await request("/ws/point", {
       method: "POST",
       auth: true,
-      body: { nome: point.name, latitude: point.lat, longitude: point.lng, tipo: point.type },
+      body: {
+        name: point.name,
+        description: point.description || "Ponto criado pelo frontend",
+        category: normalizeCategory(point.type || point.category),
+        latitude: point.lat,
+        longitude: point.lng,
+      },
     });
-    return { id: data.id, name: point.name, lat: point.lat, lng: point.lng, type: point.type };
+
+    return {
+      id: data.id,
+      name: data.name,
+      description: data.description,
+      lat: Number(data.latitude),
+      lng: Number(data.longitude),
+      type: data.category,
+    };
+  },
+
+  async updatePoint(id, point) {
+    const data = await request(`/ws/point/${id}`, {
+      method: "PUT",
+      auth: true,
+      body: {
+        name: point.name,
+        description: point.description || "Ponto atualizado pelo frontend",
+        category: normalizeCategory(point.type || point.category),
+        latitude: point.lat,
+        longitude: point.lng,
+      },
+    });
+
+    return {
+      id: data.id,
+      name: data.name,
+      description: data.description,
+      lat: Number(data.latitude),
+      lng: Number(data.longitude),
+      type: data.category,
+    };
   },
 
   async deletePoint(email, id) {
@@ -132,7 +199,7 @@ export const api = {
       writeDemoPoints(email, pts);
       return true;
     }
-    await request(`/pontos/${id}`, { method: "DELETE", auth: true });
-    return true;
+
+    throw new Error("O backend atual não possui endpoint DELETE /ws/point/{id}.");
   },
 };
